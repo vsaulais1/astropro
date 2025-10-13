@@ -1,228 +1,181 @@
-# dags/thelook_exports_hooks.py
 from __future__ import annotations
 
-import json
+import io
 from datetime import timedelta
+
 import pendulum
-
 from airflow import DAG
-from airflow.decorators import task, task_group
-from airflow.exceptions import AirflowSkipException
+from airflow.decorators import task
+from airflow.operators.python import get_current_context
 from airflow.utils.trigger_rule import TriggerRule
-from airflow.models import Variable
-from airflow.stats import Stats
+from airflow.models.param import Param
+from airflow.exceptions import AirflowSkipException
 
-from airflow.providers.google.cloud.hooks.bigquery import BigQueryHook
+# GCP
+from google.cloud import bigquery
 from airflow.providers.google.cloud.hooks.gcs import GCSHook
+from airflow.providers.google.common.hooks.base_google import GoogleBaseHook
 
-# ───────────────────────────────────────────────────────────────────────────────
-# CONFIG (edit these)
-# ───────────────────────────────────────────────────────────────────────────────
-GCP_PROJECT_ID = Variable.get("GCP_PROJECT_ID", default_var="astro-lab-se")
-BQ_LOCATION    = Variable.get("BQ_LOCATION", default_var="US")  # "US" for the public dataset
-BQ_CONN_ID     = Variable.get("BQ_CONN_ID", default_var="google_default")
-GCS_CONN_ID    = Variable.get("GCS_CONN_ID", default_var="google_default")
-
-GCS_BUCKET     = Variable.get("GCS_EXPORT_BUCKET", default_var="retail_media_extract")
-GCS_PREFIX     = Variable.get("GCS_EXPORT_PREFIX", default_var="retailer/thelook")
-BQ_DATASET     = "bigquery-public-data.thelook_ecommerce"
+GCP_CONN_ID = "google_default"  # matches your Airflow connection ID
 
 
-EXPORT_FORMAT  = "PARQUET"      # or "CSV", "JSON" (Parquet recommended)
-MAX_FILE_CEIL  = 1_073_741_824  # 1 GiB sanity ceiling per part (for validation metrics)
+# Metrics (works on Astronomer)
+try:
+    from airflow.stats import Stats
+except Exception:  # older Airflow fallback
+    from airflow import stats as Stats  # type: ignore
 
-SCHEDULE       = "@daily"
-START_DATE     = pendulum.datetime(2025, 1, 1, tz="UTC")
+LONDON = pendulum.timezone("Europe/London")
 
 default_args = {
-    "owner": "data-platform",
-    "retries": 2,
+    "owner": "data-eng",
+    "retries": 1,
     "retry_delay": timedelta(minutes=5),
 }
 
-# ───────────────────────────────────────────────────────────────────────────────
-# Helpers (Hooks-based)
-# ───────────────────────────────────────────────────────────────────────────────
-def _bq() -> BigQueryHook:
-    return BigQueryHook(
-        gcp_conn_id=BQ_CONN_ID,
-        use_legacy_sql=False,
-        location=BQ_LOCATION
-    )
-
-def _gcs() -> GCSHook:
-    return GCSHook(gcp_conn_id=GCS_CONN_ID)
-
-def _export_sql_to_gcs(sql: str, uri_prefix: str) -> dict:
-    """
-    Use BigQuery EXPORT DATA ... AS SELECT via BigQueryHook.insert_job().
-    """
-    uri = f"gs://{GCS_BUCKET}/{uri_prefix}/*.parquet" if EXPORT_FORMAT == "PARQUET" else f"gs://{GCS_BUCKET}/{uri_prefix}/*"
-    export_stmt = f"""
-    EXPORT DATA OPTIONS(
-      uri='{uri}',
-      format='{EXPORT_FORMAT}',
-      overwrite=true  
-    ) AS
-    {sql}
-    """
-    bq = _bq()
-    job = bq.insert_job(
-        configuration={
-            "query": {
-                "query": export_stmt,
-                "useLegacySql": False,
-                "location": BQ_LOCATION,
-            }
-        }
-    )
-    bq.wait_for_job(job_id=job["jobReference"]["jobId"])
-    # total bytes processed isn’t returned directly here; rely on metrics/validation
-    return {
-        "job_id": job["jobReference"]["jobId"],
-        "destination_uri": uri,
-        "state": "DONE",
-    }
-
-def _table_row_count(table: str, where: str | None = None) -> int:
-    bq = _bq()
-    sql = f"SELECT COUNT(*) AS c FROM `{table}`"
-    if where:
-        sql += f" WHERE {where}"
-    row = bq.get_first(sql)
-    return int(row[0]) if row else 0
-
-def _list_and_size(prefix: str) -> dict:
-    """
-    Use GCSHook to list object names; get sizes via hook.get_size().
-    """
-    gcs = _gcs()
-    objects = gcs.list(bucket_name=GCS_BUCKET, prefix=prefix)
-    total_bytes = 0
-    for obj in objects:
-        try:
-            total_bytes += gcs.get_size(bucket_name=GCS_BUCKET, object_name=obj) or 0
-        except Exception:
-            # If a transient error occurs on size fetch, skip that object but continue
-            continue
-    return {
-        "prefix": prefix,
-        "file_count": len(objects),
-        "total_bytes": total_bytes,
-        "examples": objects[:5],
-    }
-
-# ───────────────────────────────────────────────────────────────────────────────
-# DAG
-# ───────────────────────────────────────────────────────────────────────────────
 with DAG(
-        dag_id="thelook_extract_to_gcs_hooks",
-        description="Hooks-based extract of thelook_ecommerce to GCS (daily + monthly, parallelized)",
+        dag_id="retail_media_thelook_extract",
+        description="Extract thelook_ecommerce tables to GCS for third-party sharing",
         default_args=default_args,
-        start_date=START_DATE,
-        schedule=SCHEDULE,
+        schedule="0 2 * * *",  # 02:00 London daily
+        start_date=pendulum.datetime(2025, 1, 1, tz=LONDON),
         catchup=False,
         max_active_runs=1,
-        tags=["thelook", "gcs", "bq", "astronomer", "exports", "hooks"],
+        tags=["retail", "bigquery", "gcs", "astronomer", "taskflow"],
+        params={
+            "gcs_bucket": Param("retail_media_extract", type="string"),
+            "daily_window_days": Param(3, type="integer", minimum=1, maximum=7),
+            "bq_location": Param("US", type="string"),
+            "row_limit": Param(None, type=["null", "integer"]),
+        },
+        doc_md="""
+**Retail Media Extract (thelook_ecommerce → GCS)**
+
+- **Daily**: `order_items` → last N days (default 3), file `transactions/transaction_DDMMYYYY.csv` (append-only)
+- **Monthly (1st)**: full refresh of `products`, `users`, `distribution_centers` → `{table}/{table}_DDMMYYYY.csv` (overwrite)
+""",
 ) as dag:
 
-    # ------------------------ Control & gating ------------------------
-    @task(sla=timedelta(minutes=5))
-    def is_month_start(execution_date: str) -> bool:
-        dt = pendulum.parse(execution_date)
-        is_first = dt.day == 1
-        if not is_first:
-            print(f"Monthly full-load will skip: {dt.to_date_string()}")
+    # ---------- Helpers ----------
+    def _bq_client(location: str) -> bigquery.Client:
+        hook = GoogleBaseHook(gcp_conn_id=GCP_CONN_ID)
+        credentials, project_id = hook.get_credentials_and_project_id()
+        # project_id is used for billing the query against your project
+        return bigquery.Client(project=project_id, credentials=credentials, location=location)
+
+
+    def _format_run_date(dt: pendulum.DateTime) -> str:
+        return dt.in_timezone(LONDON).strftime("%d%m%Y")
+
+    def _upload_csv_bytes(gcs: GCSHook, bucket: str, object_name: str, data: bytes, overwrite: bool) -> None:
+        if not overwrite and gcs.exists(bucket, object_name):
+            raise AirflowSkipException(f"Already exists: gs://{bucket}/{object_name}")
+        gcs.upload(bucket_name=bucket, object_name=object_name, data=data, mime_type="text/csv", gzip=False)
+
+    def _df_to_csv_bytes(df) -> bytes:
+        import pandas as pd  # noqa: F401  (used at runtime)
+        buf = io.StringIO()
+        df.to_csv(buf, index=False)
+        return buf.getvalue().encode("utf-8")
+
+    # ---------- Monthly gate ----------
+    @task.short_circuit(task_id="is_first_of_month")
+    def is_first_of_month() -> bool:
+        ctx = get_current_context()
+        logical_date = ctx["logical_date"].in_timezone(LONDON)
+        is_first = logical_date.day == 1
+        Stats.incr("retail_media.monthly_gate.first_of_month" if is_first else "retail_media.monthly_gate.other_day")
         return is_first
 
-    @task
-    def guard_monthly(should_run: bool) -> None:
-        if not should_run:
-            raise AirflowSkipException("Not the first of the month – skipping monthly full extracts.")
+    # ---------- DAILY: order_items (rolling N-day) ----------
+    @task(task_id="order_items_daily", retries=1)
+    def extract_order_items_daily() -> dict:
+        ctx = get_current_context()
+        params = ctx["params"]
+        logical_date = ctx["logical_date"].in_timezone(LONDON)
 
-    # --------------------- DAILY: order_items (3-day window) --------------------
-    @task_group(group_id="daily_order_items")
-    def daily_order_items_group():
-        @task(sla=timedelta(minutes=15))
-        def export_order_items(logical_date: str, data_interval_end: str) -> dict:
-            dt_end = pendulum.parse(data_interval_end)          # end-exclusive
-            start_date = (dt_end - timedelta(days=3)).date()     # inclusive
-            end_date = dt_end.date()                             # exclusive in WHERE
+        start_ts = pendulum.now()
+        Stats.incr("retail_media.order_items.attempt")
 
-            where = f"DATE(created_at) >= DATE('{start_date}') AND DATE(created_at) < DATE('{end_date}')"
-            target_prefix = (
-                f"{GCS_PREFIX}/daily/order_items/"
-                f"run_date={pendulum.parse(logical_date).to_date_string()}/"
-                f"window_start={start_date}/window_end={end_date}"
-            )
-            sql = f"SELECT * FROM `{BQ_DATASET}.order_items` WHERE {where}"
-            summary = _export_sql_to_gcs(sql, target_prefix)
+        run_date_str = _format_run_date(logical_date)
+        window_days = int(params["daily_window_days"])
+        bq_location = params["bq_location"]
+        bucket = params["gcs_bucket"]
+        row_limit = params["row_limit"]
 
-            # Observability
-            row_count = _table_row_count(f"{BQ_DATASET}.order_items", where=where)
-            Stats.gauge("thelook.daily.order_items.rows", row_count)
-            print("order_items export summary:", json.dumps({**summary, "row_count": row_count}, indent=2))
-            return {"prefix": target_prefix, **summary, "row_count": row_count}
+        run_date = logical_date.date()
+        start_date = (run_date.subtract(days=window_days - 1)).to_date_string()  # YYYY-MM-DD
+        end_date_excl = (run_date.add(days=1)).to_date_string()
 
-        @task(trigger_rule=TriggerRule.ALL_DONE)
-        def validate_order_items(prefix_summary: dict):
-            prefix = prefix_summary["prefix"]
-            listing = _list_and_size(prefix)
-            if listing["file_count"] == 0:
-                Stats.incr("thelook.daily.order_items.validation_empty")
-                raise ValueError(f"No files exported under gs://{GCS_BUCKET}/{prefix}")
-            if listing["total_bytes"] > 50 * MAX_FILE_CEIL:
-                Stats.incr("thelook.daily.order_items.validation_bytes_above_ceiling")
-            Stats.gauge("thelook.daily.order_items.total_bytes", listing["total_bytes"])
-            Stats.gauge("thelook.daily.order_items.files", listing["file_count"])
-            print("order_items validation:", json.dumps(listing, indent=2))
+        sql = f"""
+        SELECT *
+        FROM `bigquery-public-data.thelook_ecommerce.order_items`
+        WHERE DATE(created_at, 'Europe/London') >= DATE('{start_date}')
+          AND DATE(created_at, 'Europe/London') <  DATE('{end_date_excl}')
+        """
+        if row_limit:
+            sql += f"\nLIMIT {int(row_limit)}"
 
-        exported = export_order_items(
-            logical_date="{{ logical_date }}",
-            data_interval_end="{{ data_interval_end }}",
-        )
-        validate_order_items(exported)
+        client = _bq_client(bq_location)
+        df = client.query(sql).to_dataframe(create_bqstorage_client=True)
 
-    # -------------------- MONTHLY: full extracts (3 tables) ---------------------
-    @task_group(group_id="monthly_full")
-    def monthly_full_group():
-        def _monthly_export_task(table: str):
-            safe = table.replace(".", "_")
+        object_name = f"transactions/transaction_{run_date_str}.csv"
+        gcs = GCSHook(gcp_conn_id=GCP_CONN_ID)
+        _upload_csv_bytes(gcs, bucket, object_name, _df_to_csv_bytes(df), overwrite=False)
 
-            @task(sla=timedelta(minutes=30))
-            def _export(logical_date: str) -> dict:
-                run_day = pendulum.parse(logical_date).to_date_string()
-                run_month = run_day[:7]  # YYYY-MM
-                target_prefix = f"{GCS_PREFIX}/monthly/{safe}/run_month={run_month}"
-                sql = f"SELECT * FROM `{table}`"
-                summary = _export_sql_to_gcs(sql, target_prefix)
-                row_count = _table_row_count(table)
-                Stats.gauge(f"thelook.monthly.{table.split('.')[-1]}.rows", row_count)
-                print(f"{table} export summary:", json.dumps({**summary, "row_count": row_count}, indent=2))
-                return {"prefix": target_prefix, **summary, "row_count": row_count}
+        elapsed_ms = int((pendulum.now() - start_ts).total_seconds() * 1000)
+        Stats.timing("retail_media.order_items.runtime_ms", elapsed_ms)
+        Stats.incr("retail_media.order_items.success")
+        return {"rows": len(df), "gcs_uri": f"gs://{bucket}/{object_name}"}
 
-            @task(trigger_rule=TriggerRule.ALL_DONE)
-            def _validate(prefix_summary: dict):
-                prefix = prefix_summary["prefix"]
-                listing = _list_and_size(prefix)
-                if listing["file_count"] == 0:
-                    Stats.incr(f"thelook.monthly.{table.split('.')[-1]}.validation_empty")
-                    raise ValueError(f"No files exported under gs://{GCS_BUCKET}/{prefix}")
-                Stats.gauge(f"thelook.monthly.{table.split('.')[-1]}.total_bytes", listing["total_bytes"])
-                Stats.gauge(f"thelook.monthly.{table.split('.')[-1]}.files", listing["file_count"])
-                print(f"{table} validation:", json.dumps(listing, indent=2))
+    # ---------- MONTHLY: full extracts (overwrite) ----------
+    def _monthly_full_extract_task(table: str, folder: str, task_id: str):
+        @task(task_id=task_id, retries=1)
+        def _inner() -> dict:
+            ctx = get_current_context()
+            params = ctx["params"]
+            logical_date = ctx["logical_date"].in_timezone(LONDON)
 
-            v = _export(logical_date="{{ logical_date }}")
-            _validate(v)
+            start_ts = pendulum.now()
+            Stats.incr(f"retail_media.{table}.attempt")
 
-        _monthly_export_task(f"{BQ_DATASET}.products")
-        _monthly_export_task(f"{BQ_DATASET}.users")
-        _monthly_export_task(f"{BQ_DATASET}.distribution_centers")
+            bq_location = params["bq_location"]
+            bucket = params["gcs_bucket"]
+            row_limit = params["row_limit"]
+            run_date_str = _format_run_date(logical_date)
 
-    # ------------------------------ Wiring --------------------------------------
-    daily = daily_order_items_group()
-    monthly_gate = guard_monthly(is_month_start("{{ logical_date }}"))
-    monthly = monthly_full_group()
+            sql = f"SELECT * FROM `bigquery-public-data.thelook_ecommerce.{table}`"
+            if row_limit:
+                sql += f"\nLIMIT {int(row_limit)}"
 
-    monthly_gate >> monthly
-    # Daily path runs independently to allow parallelism with monthly on day-1
+            client = _bq_client(bq_location)
+            df = client.query(sql).to_dataframe(create_bqstorage_client=True)
+
+            object_name = f"{folder}/{folder}_{run_date_str}.csv"
+            gcs = GCSHook(gcp_conn_id=GCP_CONN_ID)
+            _upload_csv_bytes(gcs, bucket, object_name, _df_to_csv_bytes(df), overwrite=True)
+
+            elapsed_ms = int((pendulum.now() - start_ts).total_seconds() * 1000)
+            Stats.timing(f"retail_media.{table}.runtime_ms", elapsed_ms)
+            Stats.incr(f"retail_media.{table}.success")
+            return {"rows": len(df), "gcs_uri": f"gs://{bucket}/{object_name}"}
+
+        return _inner
+
+    extract_products_monthly = _monthly_full_extract_task("products", "products", "products_monthly")
+    extract_users_monthly = _monthly_full_extract_task("users", "users", "users_monthly")
+    extract_dc_monthly = _monthly_full_extract_task("distribution_centers", "distribution_centers", "distribution_centers_monthly")
+
+    @task(task_id="all_done", trigger_rule=TriggerRule.ALL_DONE)
+    def all_done():
+        Stats.incr("retail_media.run.completed")
+
+    # ---------- Wiring (parallel by default) ----------
+    daily = extract_order_items_daily()
+    monthly_gate = is_first_of_month()
+    monthly_products = extract_products_monthly()
+    monthly_users = extract_users_monthly()
+    monthly_dc = extract_dc_monthly()
+
+    monthly_gate >> [monthly_products, monthly_users, monthly_dc]
+    [daily, monthly_products, monthly_users, monthly_dc] >> all_done()
