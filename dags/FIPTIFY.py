@@ -24,29 +24,10 @@ from airflow.hooks.base import BaseHook
 import spotipy
 from spotipy.oauth2 import SpotifyClientCredentials, SpotifyOAuth
 from spotipy.cache_handler import MemoryCacheHandler, CacheFileHandler
+from include.FIPTIFY_config import fiptify_config
 
-
-# ------------------------------
-# Config (tweak to your liking)
-# ------------------------------
-LOCAL_TZ = "Europe/Paris"  # FIP/Radio France local time
-RUN_TZ = pendulum.timezone(LOCAL_TZ)
-
-OUTPUT_DIR = "/tmp/fip_groove"   # Airflow worker local FS
-OUTPUT_CSV = "FIP_GROOVE.csv"    # written per run under OUTPUT_DIR/run_id/
-
-#RADIOFRANCE_API = "https://openapi.radiofrance.fr/v1/graphql"
-RADIOFRANCE_STATION = "FIP_GROOVE"
-
-# Playlist naming scheme
-PLAYLIST_NAME_TEMPLATE = "My {month_name} FIP Groove Playlist"  # e.g., "My October FIP Groove Playlist"
-PLAYLIST_DESCRIPTION = (
-    "A selection of tracks played on FIP Groove – Playlist generated automatically via Radio France API and Spotify."
-)
-
-# Spotify add-tracks batch size
-SPOTIFY_BATCH_SIZE = 100
-
+#Config
+conf = fiptify_config()
 
 def _ensure_dir(path: str | Path) -> Path:
     p = Path(path)
@@ -58,7 +39,7 @@ def _yesterday_unix_range_paris(now: datetime) -> tuple[int, int, str]:
     """
     Compute yesterday's [start, end] Unix timestamps for Europe/Paris, and return month name for playlist naming.
     """
-    dt_now = RUN_TZ.convert(pendulum.instance(now))
+    dt_now = conf.RUN_TZ.convert(pendulum.instance(now))
     y_start = dt_now.subtract(days=1).start_of("day")
     y_end = dt_now.subtract(days=1).end_of("day")
     return int(y_start.timestamp()), int(y_end.timestamp()), y_start.format("MMMM")
@@ -96,10 +77,10 @@ def _get_spotify_app_creds():
 # The DAG
 # -------------
 @dag(
-    dag_id="fip_groove_to_spotify",
+    dag_id="BONUS_DAG_fip_groove_to_spotify",
     description="Build a monthly FIP Groove playlist from Radio France plays and push to Spotify.",
     schedule="@daily",                  # runs daily; each run processes *yesterday*
-    start_date=pendulum.datetime(2025, 10, 1, tz=LOCAL_TZ),
+    start_date=pendulum.datetime(2025, 10, 1, tz=conf.LOCAL_TZ),
     catchup=False,
     default_args={"retries": 1, "retry_delay": timedelta(minutes=5)},
     tags=["radiofrance", "spotify", "music", "fip"],
@@ -140,7 +121,7 @@ def fip_groove_to_spotify_dag():
 
         query = f"""
         {{
-          grid(start: {start_ts}, end: {end_ts}, station: {RADIOFRANCE_STATION}, includeTracks: true) {{
+          grid(start: {start_ts}, end: {end_ts}, station: {conf.RADIOFRANCE_STATION}, includeTracks: true) {{
             ... on TrackStep {{
               id
               track {{
@@ -188,8 +169,8 @@ def fip_groove_to_spotify_dag():
 
         if df.empty:
             # Still write an empty CSV for observability
-            out_dir = _ensure_dir(Path(OUTPUT_DIR) / run_id)
-            out_csv = out_dir / OUTPUT_CSV
+            out_dir = _ensure_dir(Path(conf.OUTPUT_DIR) / run_id)
+            out_csv = out_dir / conf.OUTPUT_CSV
             df.to_csv(out_csv, index=False)
             return {"csv_path": str(out_csv), "search_items": []}
 
@@ -210,8 +191,8 @@ def fip_groove_to_spotify_dag():
         clean_table = df[existing_cols].drop_duplicates()
 
         # Write CSV artifact
-        out_dir = _ensure_dir(Path(OUTPUT_DIR) / run_id)
-        out_csv = out_dir / OUTPUT_CSV
+        out_dir = _ensure_dir(Path(conf.OUTPUT_DIR) / run_id)
+        out_csv = out_dir / conf.OUTPUT_CSV
         clean_table.to_csv(out_csv, index=False)
 
         # Build search records for Spotify
@@ -368,7 +349,7 @@ def fip_groove_to_spotify_dag():
         sp = spotipy.Spotify(auth_manager=auth_manager, requests_timeout=30, retries=3)
 
         month_name = window["month_name"]
-        playlist_name = PLAYLIST_NAME_TEMPLATE.format(month_name=month_name)
+        playlist_name = conf.PLAYLIST_NAME_TEMPLATE.format(month_name=month_name)
 
         # Find existing playlist (first exact name match owned by the user)
         playlist_id = None
@@ -389,7 +370,7 @@ def fip_groove_to_spotify_dag():
                 name=playlist_name,
                 public=("private" not in scope),  # heuristic: private if scope contains 'private'
                 collaborative=False,
-                description=PLAYLIST_DESCRIPTION,
+                description=conf.PLAYLIST_DESCRIPTION,
             )
             playlist_id = pl["id"]
 
@@ -413,7 +394,7 @@ def fip_groove_to_spotify_dag():
         to_add = [u for u in uris if u not in existing_uris]
         added_total = 0
 
-        for chunk in _chunked(to_add, SPOTIFY_BATCH_SIZE):
+        for chunk in _chunked(to_add, conf.SPOTIFY_BATCH_SIZE):
             sp.playlist_add_items(playlist_id, chunk)
             added_total += len(chunk)
             time.sleep(0.2)

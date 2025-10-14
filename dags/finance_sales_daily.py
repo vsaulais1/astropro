@@ -1,5 +1,3 @@
-# dags/thelook_bq_to_snowflake_incremental.py
-
 from __future__ import annotations
 
 import os
@@ -17,105 +15,31 @@ from airflow.providers.google.cloud.hooks.bigquery import BigQueryHook
 from airflow.providers.google.cloud.hooks.gcs import GCSHook
 from google.cloud import bigquery
 from airflow.providers.snowflake.hooks.snowflake import SnowflakeHook
+from include.finance_sales_daily_sql import AGG_SQL_TEMPLATE
+from include.finance_sales_daily_config import finance_config
 
 
-# --------------------------
-# Config: EDIT THESE
-# --------------------------
-GCP_CONN_ID = "google_default"
-GCS_CONN_ID = "google_default"  # or a dedicated GCS conn id
-GCS_BUCKET = "finance_sales"
-GCS_PREFIX = "thelook/daily_sales"    # no leading/trailing slash
-GCS_FILENAME = "thelook_daily_sales.csv"
-
-SNOWFLAKE_CONN_ID = "snowflake_default"
-SNOWFLAKE_DATABASE = "FINANCE"
-SNOWFLAKE_SCHEMA = "SALES"
-SNOWFLAKE_TABLE = "DAILY_SALES"
-SNOWFLAKE_STAGE = "GCS_THELOOK_STAGE"
-SNOWFLAKE_FILE_FORMAT = "GCS_THELOOK_CSV_FMT"
-SNOWFLAKE_STORAGE_INTEGRATION = "GCS_INT_THELOOK"  # replace with your integration
-
-TZ = "Europe/London"
-TMP_DIR = "/tmp"
-
-# OpenLineage / Datasets (Astronomer observability)
-BQ_INLETS = [
-    Dataset("bigquery://bigquery-public-data/thelook_ecommerce/order_items"),
-    Dataset("bigquery://bigquery-public-data/thelook_ecommerce/products"),
-    Dataset("bigquery://bigquery-public-data/thelook_ecommerce/users"),
-    Dataset("bigquery://bigquery-public-data/thelook_ecommerce/distribution_centers"),
-    Dataset("bigquery://bigquery-public-data/thelook_ecommerce/inventory_items"),
-]
-SNOWFLAKE_OUTLET = Dataset(f"snowflake://{SNOWFLAKE_DATABASE}/{SNOWFLAKE_SCHEMA}/{SNOWFLAKE_TABLE}")
-
-# --------------------------
-# Core SQL (aggregation)
-# --------------------------
-AGG_SQL_TEMPLATE = """
-WITH oi AS (
-  SELECT
-    DATE(created_at) AS order_date,
-    inventory_item_id,
-    product_id,
-    user_id,
-    CAST(sale_price AS NUMERIC) AS sale_price
-  FROM `bigquery-public-data.thelook_ecommerce.order_items`
-  WHERE DATE(created_at) >= DATE(@start_date)
-    AND DATE(created_at) <  DATE(@end_date)
-),
-enriched AS (
-  SELECT
-    oi.order_date,
-    dc.id AS distribution_center_id,
-    dc.name AS distribution_center,
-    p.category,
-    p.department,
-    oi.sale_price
-  FROM oi
-  JOIN `bigquery-public-data.thelook_ecommerce.inventory_items` ii
-    ON oi.inventory_item_id = ii.id
-  JOIN `bigquery-public-data.thelook_ecommerce.distribution_centers` dc
-    ON ii.product_distribution_center_id = dc.id
-  JOIN `bigquery-public-data.thelook_ecommerce.products` p
-    ON oi.product_id = p.id
-  JOIN `bigquery-public-data.thelook_ecommerce.users` u
-    ON oi.user_id = u.id
-)
-SELECT
-  order_date,
-  distribution_center_id,
-  distribution_center,
-  category,
-  department,
-  --COUNT(1) AS units,
-  SUM(sale_price) AS gross_sales,
-  --AVG(sale_price) AS avg_unit_price
-FROM enriched
-GROUP BY 1,2,3,4,5
-ORDER BY 1,2,4,5;
-"""
-
+conf = finance_config()
 
 @dag(
-    dag_id="thelook_bq_to_snowflake_incremental",
-    description="Incremental (order_date) from BigQuery (thelook_ecommerce) to Snowflake via GCS + COPY INTO + MERGE + validation",
+    dag_id="DAG1_thelook_bq_to_snowflake_incremental",
+    description="Incremental (order_date) from BigQuery (thelook_ecommerce) to Snowflake via GCS + COPY INTO + MERGE + validation. Creates a DAG with at least 4 tasks that are serially dependent.",
     schedule="@daily",
-    start_date=pendulum.datetime(2024, 1, 1, tz=TZ),
+    start_date=pendulum.datetime(2024, 1, 1, tz=conf.TZ),
     catchup=False,
-    tags=["thelook", "bigquery", "snowflake", "gcs", "incremental", "observability", "validation"],
+    tags=["Sequential","thelook", "bigquery", "snowflake", "gcs", "incremental", "observability", "validation"],
 )
 def thelook_bq_to_snowflake_incremental():
     logger = LoggingMixin().log
 
-    @task(inlets=[SNOWFLAKE_OUTLET], outlets=[SNOWFLAKE_OUTLET], task_id="get_max_loaded_date")
+    @task(inlets=[conf.SNOWFLAKE_OUTLET], outlets=[conf.SNOWFLAKE_OUTLET], task_id="get_max_loaded_date")
     def get_max_loaded_date() -> dict:
-        sf = SnowflakeHook(snowflake_conn_id=SNOWFLAKE_CONN_ID)
+        sf = SnowflakeHook(snowflake_conn_id=conf.SNOWFLAKE_CONN_ID)
         max_date = None
         with sf.get_conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(f"""
-                    CREATE TABLE IF NOT EXISTS {SNOWFLAKE_DATABASE}.{SNOWFLAKE_SCHEMA}.{SNOWFLAKE_TABLE} (
+                    CREATE TABLE IF NOT EXISTS {conf.SNOWFLAKE_DATABASE}.{conf.SNOWFLAKE_SCHEMA}.{conf.SNOWFLAKE_TABLE} (
                         ORDER_DATE DATE,
                         DISTRIBUTION_CENTER_ID NUMBER,
                         DISTRIBUTION_CENTER STRING,
@@ -126,16 +50,16 @@ def thelook_bq_to_snowflake_incremental():
                         --AVG_UNIT_PRICE NUMBER
                     );
                 """)
-                cur.execute(f"SELECT MAX(ORDER_DATE) FROM {SNOWFLAKE_DATABASE}.{SNOWFLAKE_SCHEMA}.{SNOWFLAKE_TABLE}")
+                cur.execute(f"SELECT MAX(ORDER_DATE) FROM {conf.SNOWFLAKE_DATABASE}.{conf.SNOWFLAKE_SCHEMA}.{conf.SNOWFLAKE_TABLE}")
                 row = cur.fetchone()
                 if row and row[0]:
                     max_date = row[0]  # datetime.date
         logger.info("Current max ORDER_DATE in Snowflake: %s", max_date)
         return {"max_order_date": str(max_date) if max_date else None}
 
-    @task(inlets=BQ_INLETS, outlets=[Dataset("gs://" + GCS_BUCKET + "/" + GCS_PREFIX)], task_id="extract_from_bigquery_to_gcs")
+    @task(inlets=conf.BQ_INLETS, outlets=[Dataset("gs://" + conf.GCS_BUCKET + "/" + conf.GCS_PREFIX)], task_id="extract_from_bigquery_to_gcs")
     def extract_from_bigquery_to_gcs(meta: dict) -> dict:
-        tz_now = pendulum.now(TZ).date()
+        tz_now = pendulum.now(conf.TZ).date()
         window_end_pend = tz_now  # exclusive (yesterday inclusive)
 
         max_loaded = meta.get("max_order_date")
@@ -159,7 +83,7 @@ def thelook_bq_to_snowflake_incremental():
             }
 
         # Use BigQuery client directly via the hook
-        bq_hook = BigQueryHook(gcp_conn_id=GCP_CONN_ID, use_legacy_sql=False)
+        bq_hook = BigQueryHook(gcp_conn_id=conf.GCP_CONN_ID, use_legacy_sql=False)
         client: bigquery.Client = bq_hook.get_client()
 
         job_config = bigquery.QueryJobConfig(
@@ -189,17 +113,17 @@ def thelook_bq_to_snowflake_incremental():
             }
 
         os.makedirs(TMP_DIR, exist_ok=True)
-        local_csv = os.path.join(TMP_DIR, GCS_FILENAME)
+        local_csv = os.path.join(conf.TMP_DIR, conf.GCS_FILENAME)
         df.to_csv(local_csv, index=False)
 
         batch_dt = str(window_end - timedelta(days=1))
-        batch_prefix = f"{GCS_PREFIX}/batch_dt={batch_dt}"
-        object_name = f"{batch_prefix}/{GCS_FILENAME}"
+        batch_prefix = f"{conf.GCS_PREFIX}/batch_dt={batch_dt}"
+        object_name = f"{batch_prefix}/{conf.GCS_FILENAME}"
 
-        gcs = GCSHook(gcp_conn_id=GCS_CONN_ID)
-        gcs.upload(bucket_name=GCS_BUCKET, object_name=object_name, filename=local_csv)
+        gcs = GCSHook(gcp_conn_id=conf.GCS_CONN_ID)
+        gcs.upload(bucket_name=conf.GCS_BUCKET, object_name=object_name, filename=local_csv)
 
-        gcs_uri = f"gs://{GCS_BUCKET}/{object_name}"
+        gcs_uri = f"gs://{conf.GCS_BUCKET}/{object_name}"
         logger.info("Uploaded batch to %s", gcs_uri)
 
         return {
@@ -211,7 +135,7 @@ def thelook_bq_to_snowflake_incremental():
         }
 
 
-    @task(inlets=[Dataset("gs://"+GCS_BUCKET+"/"+GCS_PREFIX)], outlets=[SNOWFLAKE_OUTLET], task_id="copy_merge_into_snowflake")
+    @task(inlets=[Dataset("gs://"+conf.GCS_BUCKET+"/"+conf.GCS_PREFIX)], outlets=[conf.SNOWFLAKE_OUTLET], task_id="copy_merge_into_snowflake")
     def copy_merge_into_snowflake(meta: dict) -> dict:
         gcs_uri = meta.get("gcs_uri")
         batch_prefix = meta.get("batch_prefix")
@@ -219,11 +143,11 @@ def thelook_bq_to_snowflake_incremental():
         if not gcs_uri or extracted_rows == 0:
             return {"copied": 0, "merged_updated": 0, "merged_inserted": 0, "message": "No new data to load."}
 
-        sf = SnowflakeHook(snowflake_conn_id=SNOWFLAKE_CONN_ID)
+        sf = SnowflakeHook(snowflake_conn_id=conf.SNOWFLAKE_CONN_ID)
         with sf.get_conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(f"""
-                  CREATE OR REPLACE FILE FORMAT {SNOWFLAKE_DATABASE}.{SNOWFLAKE_SCHEMA}.{SNOWFLAKE_FILE_FORMAT}
+                  CREATE OR REPLACE FILE FORMAT {conf.SNOWFLAKE_DATABASE}.{conf.SNOWFLAKE_SCHEMA}.{conf.SNOWFLAKE_FILE_FORMAT}
                   TYPE = CSV
                   PARSE_HEADER = TRUE
                   FIELD_OPTIONALLY_ENCLOSED_BY = '\"'
@@ -231,28 +155,28 @@ def thelook_bq_to_snowflake_incremental():
                   NULL_IF = ('', 'NULL')
                 """)
                 cur.execute(f"""
-                    CREATE STAGE IF NOT EXISTS {SNOWFLAKE_DATABASE}.{SNOWFLAKE_SCHEMA}.{SNOWFLAKE_STAGE}
-                    URL = 'gcs://{GCS_BUCKET}'
-                    STORAGE_INTEGRATION = {SNOWFLAKE_STORAGE_INTEGRATION}
+                    CREATE STAGE IF NOT EXISTS {conf.SNOWFLAKE_DATABASE}.{conf.SNOWFLAKE_SCHEMA}.{conf.SNOWFLAKE_STAGE}
+                    URL = 'gcs://{conf.GCS_BUCKET}'
+                    STORAGE_INTEGRATION = {conf.SNOWFLAKE_STORAGE_INTEGRATION}
                 """)
 
-                staging_table = f"{SNOWFLAKE_DATABASE}.{SNOWFLAKE_SCHEMA}.{SNOWFLAKE_TABLE}_STAGING"
+                staging_table = f"{conf.SNOWFLAKE_DATABASE}.{conf.SNOWFLAKE_SCHEMA}.{conf.SNOWFLAKE_TABLE}_STAGING"
                 cur.execute(f"""
-                    CREATE OR REPLACE TEMP TABLE {staging_table} LIKE {SNOWFLAKE_DATABASE}.{SNOWFLAKE_SCHEMA}.{SNOWFLAKE_TABLE}
+                    CREATE OR REPLACE TEMP TABLE {staging_table} LIKE {conf.SNOWFLAKE_DATABASE}.{conf.SNOWFLAKE_SCHEMA}.{conf.SNOWFLAKE_TABLE}
                 """)
 
-                pattern = f"^{batch_prefix.replace('/', '\/')}\/{GCS_FILENAME}$"
+                pattern = f"^{batch_prefix.replace('/', '\/')}\/{conf.GCS_FILENAME}$"
                 copy_sql = f"""
                     COPY INTO {staging_table}
-                    FROM @{SNOWFLAKE_DATABASE}.{SNOWFLAKE_SCHEMA}.{SNOWFLAKE_STAGE}
-                    FILE_FORMAT = (FORMAT_NAME={SNOWFLAKE_DATABASE}.{SNOWFLAKE_SCHEMA}.{SNOWFLAKE_FILE_FORMAT})
+                    FROM @{conf.SNOWFLAKE_DATABASE}.{conf.SNOWFLAKE_SCHEMA}.{conf.SNOWFLAKE_STAGE}
+                    FILE_FORMAT = (FORMAT_NAME={conf.SNOWFLAKE_DATABASE}.{conf.SNOWFLAKE_SCHEMA}.{conf.SNOWFLAKE_FILE_FORMAT})
                     PATTERN = '{pattern}'
                     ON_ERROR = 'ABORT_STATEMENT'
                     MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE
                 """
                 cur.execute(copy_sql)
 
-                target = f"{SNOWFLAKE_DATABASE}.{SNOWFLAKE_SCHEMA}.{SNOWFLAKE_TABLE}"
+                target = f"{conf.SNOWFLAKE_DATABASE}.{conf.SNOWFLAKE_SCHEMA}.{conf.SNOWFLAKE_TABLE}"
                 merge_sql = f"""
                     MERGE INTO {target} t
                     USING {staging_table} s
@@ -287,7 +211,7 @@ def thelook_bq_to_snowflake_incremental():
     # --------------------------
     # NEW: Step 4 — Validation
     # --------------------------
-    @task(inlets=[SNOWFLAKE_OUTLET], outlets=[SNOWFLAKE_OUTLET], task_id="validate_loaded_window")
+    @task(inlets=[conf.SNOWFLAKE_OUTLET], outlets=[conf.SNOWFLAKE_OUTLET], task_id="validate_loaded_window")
     def validate_loaded_window(extract_meta: dict, load_meta: dict, tolerance: float = 0.0) -> dict:
         """
         Validates that Snowflake has the expected number of rows for the extracted date window.
@@ -312,12 +236,12 @@ def thelook_bq_to_snowflake_incremental():
                 "copied_from_gcs": copied,
             }
 
-        sf = SnowflakeHook(snowflake_conn_id=SNOWFLAKE_CONN_ID)
+        sf = SnowflakeHook(snowflake_conn_id=conf.SNOWFLAKE_CONN_ID)
         with sf.get_conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(f"""
                     SELECT COUNT(*) 
-                    FROM {SNOWFLAKE_DATABASE}.{SNOWFLAKE_SCHEMA}.{SNOWFLAKE_TABLE}
+                    FROM {conf.SNOWFLAKE_DATABASE}.{conf.SNOWFLAKE_SCHEMA}.{conf.SNOWFLAKE_TABLE}
                     WHERE ORDER_DATE >= TO_DATE(%s)
                       AND ORDER_DATE <  TO_DATE(%s)
                 """, (start_date, end_date_excl))

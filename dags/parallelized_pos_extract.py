@@ -34,14 +34,14 @@ default_args = {
 }
 
 with DAG(
-        dag_id="retail_media_thelook_extract",
-        description="Extract thelook_ecommerce tables to GCS for third-party sharing",
+        dag_id="DAG2_retail_media_thelook_extract",
+        description="Extract thelook_ecommerce tables to GCS for third-party sharing. Create a parallel DAG with at least 4 tasks where each task is run independently.",
         default_args=default_args,
         schedule="0 2 * * *",  # 02:00 London daily
         start_date=pendulum.datetime(2025, 1, 1, tz=LONDON),
         catchup=False,
         max_active_runs=1,
-        tags=["retail", "bigquery", "gcs", "astronomer", "taskflow"],
+        tags=["parallelized","retail", "bigquery", "gcs", "astronomer", "taskflow"],
         params={
             "gcs_bucket": Param("retail_media_extract", type="string"),
             "daily_window_days": Param(3, type="integer", minimum=1, maximum=7),
