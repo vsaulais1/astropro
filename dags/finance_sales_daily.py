@@ -32,7 +32,7 @@ conf = finance_config()
 def thelook_bq_to_snowflake_incremental():
     logger = LoggingMixin().log
 
-    @task(inlets=[conf.SNOWFLAKE_OUTLET], outlets=[conf.SNOWFLAKE_OUTLET], task_id="get_max_loaded_date")
+    @task(task_id="get_max_loaded_date")
     def get_max_loaded_date() -> dict:
         sf = SnowflakeHook(snowflake_conn_id=conf.SNOWFLAKE_CONN_ID)
         max_date = None
@@ -57,7 +57,7 @@ def thelook_bq_to_snowflake_incremental():
         logger.info("Current max ORDER_DATE in Snowflake: %s", max_date)
         return {"max_order_date": str(max_date) if max_date else None}
 
-    @task(inlets=conf.BQ_INLETS, outlets=[Dataset("gs://" + conf.GCS_BUCKET + "/" + conf.GCS_PREFIX)], task_id="extract_from_bigquery_to_gcs")
+    @task(task_id="extract_from_bigquery_to_gcs")
     def extract_from_bigquery_to_gcs(meta: dict) -> dict:
         tz_now = pendulum.now(conf.TZ).date()
         window_end_pend = tz_now  # exclusive (yesterday inclusive)
@@ -135,7 +135,7 @@ def thelook_bq_to_snowflake_incremental():
         }
 
 
-    @task(inlets=[Dataset("gs://"+conf.GCS_BUCKET+"/"+conf.GCS_PREFIX)], outlets=[conf.SNOWFLAKE_OUTLET], task_id="copy_merge_into_snowflake")
+    @task(task_id="copy_merge_into_snowflake")
     def copy_merge_into_snowflake(meta: dict) -> dict:
         gcs_uri = meta.get("gcs_uri")
         batch_prefix = meta.get("batch_prefix")
@@ -211,7 +211,7 @@ def thelook_bq_to_snowflake_incremental():
     # --------------------------
     # NEW: Step 4 — Validation
     # --------------------------
-    @task(inlets=[conf.SNOWFLAKE_OUTLET], outlets=[conf.SNOWFLAKE_OUTLET], task_id="validate_loaded_window")
+    @task(task_id="validate_loaded_window")
     def validate_loaded_window(extract_meta: dict, load_meta: dict, tolerance: float = 0.0) -> dict:
         """
         Validates that Snowflake has the expected number of rows for the extracted date window.
