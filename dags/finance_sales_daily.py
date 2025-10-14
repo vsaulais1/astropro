@@ -68,9 +68,8 @@ def thelook_bq_to_snowflake_incremental():
         logger.info("Current max ORDER_DATE in Snowflake: %s", max_date)
         return {"max_order_date": str(max_date) if max_date else None}
 
-    @task(inlets=BQ_INLETS, outlets=[Dataset("gs://" + conf.GCS_BUCKET + "/" + conf.GCS_PREFIX)], task_id="extract_from_bigquery_to_gcs")
+    @task(queue = "a10-worker-q",inlets=BQ_INLETS, outlets=[Dataset("gs://" + conf.GCS_BUCKET + "/" + conf.GCS_PREFIX)], task_id="extract_from_bigquery_to_gcs")
     def extract_from_bigquery_to_gcs(meta: dict) -> dict:
-        queue = 'a10-worker-q'
         tz_now = pendulum.now(conf.TZ).date()
         window_end_pend = tz_now  # exclusive (yesterday inclusive)
 
