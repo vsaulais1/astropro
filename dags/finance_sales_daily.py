@@ -70,6 +70,7 @@ def thelook_bq_to_snowflake_incremental():
 
     @task(inlets=BQ_INLETS, outlets=[Dataset("gs://" + conf.GCS_BUCKET + "/" + conf.GCS_PREFIX)], task_id="extract_from_bigquery_to_gcs")
     def extract_from_bigquery_to_gcs(meta: dict) -> dict:
+        queue = 'a10-worker-q'
         tz_now = pendulum.now(conf.TZ).date()
         window_end_pend = tz_now  # exclusive (yesterday inclusive)
 
