@@ -112,7 +112,7 @@ def thelook_bq_to_snowflake_incremental():
                 "batch_prefix": None,
             }
 
-        os.makedirs(TMP_DIR, exist_ok=True)
+        os.makedirs(conf.TMP_DIR, exist_ok=True)
         local_csv = os.path.join(conf.TMP_DIR, conf.GCS_FILENAME)
         df.to_csv(local_csv, index=False)
 
