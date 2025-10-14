@@ -21,6 +21,17 @@ from include.finance_sales_daily_config import finance_config
 
 conf = finance_config()
 
+# OpenLineage / Datasets (Astronomer observability)
+BQ_INLETS = [
+    Dataset("bigquery://bigquery-public-data/thelook_ecommerce/order_items"),
+    Dataset("bigquery://bigquery-public-data/thelook_ecommerce/products"),
+    Dataset("bigquery://bigquery-public-data/thelook_ecommerce/users"),
+    Dataset("bigquery://bigquery-public-data/thelook_ecommerce/distribution_centers"),
+    Dataset("bigquery://bigquery-public-data/thelook_ecommerce/inventory_items"),
+]
+SNOWFLAKE_OUTLET = Dataset(f"snowflake://{conf.SNOWFLAKE_DATABASE}/{conf.SNOWFLAKE_SCHEMA}/{conf.SNOWFLAKE_TABLE}")
+
+
 @dag(
     dag_id="DAG1_thelook_bq_to_snowflake_incremental",
     description="Incremental (order_date) from BigQuery (thelook_ecommerce) to Snowflake via GCS + COPY INTO + MERGE + validation. Creates a DAG with at least 4 tasks that are serially dependent.",
@@ -32,7 +43,7 @@ conf = finance_config()
 def thelook_bq_to_snowflake_incremental():
     logger = LoggingMixin().log
 
-    @task(task_id="get_max_loaded_date")
+    @task(inlets=[SNOWFLAKE_OUTLET], outlets=[SNOWFLAKE_OUTLET], task_id="get_max_loaded_date")
     def get_max_loaded_date() -> dict:
         sf = SnowflakeHook(snowflake_conn_id=conf.SNOWFLAKE_CONN_ID)
         max_date = None
@@ -57,7 +68,7 @@ def thelook_bq_to_snowflake_incremental():
         logger.info("Current max ORDER_DATE in Snowflake: %s", max_date)
         return {"max_order_date": str(max_date) if max_date else None}
 
-    @task(task_id="extract_from_bigquery_to_gcs")
+    @task(inlets=conf.BQ_INLETS, outlets=[Dataset("gs://" + conf.GCS_BUCKET + "/" + conf.GCS_PREFIX)], task_id="extract_from_bigquery_to_gcs")
     def extract_from_bigquery_to_gcs(meta: dict) -> dict:
         tz_now = pendulum.now(conf.TZ).date()
         window_end_pend = tz_now  # exclusive (yesterday inclusive)
@@ -135,7 +146,7 @@ def thelook_bq_to_snowflake_incremental():
         }
 
 
-    @task(task_id="copy_merge_into_snowflake")
+    @task(inlets=[Dataset("gs://"+conf.GCS_BUCKET+"/"+conf.GCS_PREFIX)], outlets=[SNOWFLAKE_OUTLET], task_id="copy_merge_into_snowflake")
     def copy_merge_into_snowflake(meta: dict) -> dict:
         gcs_uri = meta.get("gcs_uri")
         batch_prefix = meta.get("batch_prefix")
@@ -211,7 +222,7 @@ def thelook_bq_to_snowflake_incremental():
     # --------------------------
     # NEW: Step 4 — Validation
     # --------------------------
-    @task(task_id="validate_loaded_window")
+    @task(inlets=[SNOWFLAKE_OUTLET], outlets=[SNOWFLAKE_OUTLET], task_id="validate_loaded_window")
     def validate_loaded_window(extract_meta: dict, load_meta: dict, tolerance: float = 0.0) -> dict:
         """
         Validates that Snowflake has the expected number of rows for the extracted date window.

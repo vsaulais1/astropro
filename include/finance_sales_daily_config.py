@@ -21,14 +21,3 @@ class finance_config:
 
         self.TZ = "Europe/London"
         self.TMP_DIR = "/tmp"
-
-        # OpenLineage / Datasets (Astronomer observability)
-        self.BQ_INLETS = [
-            Dataset("bigquery://bigquery-public-data/thelook_ecommerce/order_items"),
-            Dataset("bigquery://bigquery-public-data/thelook_ecommerce/products"),
-            Dataset("bigquery://bigquery-public-data/thelook_ecommerce/users"),
-            Dataset("bigquery://bigquery-public-data/thelook_ecommerce/distribution_centers"),
-            Dataset("bigquery://bigquery-public-data/thelook_ecommerce/inventory_items"),
-        ]
-        self.SNOWFLAKE_OUTLET = Dataset(f"snowflake://{self.SNOWFLAKE_DATABASE}/{self.SNOWFLAKE_SCHEMA}/{self.SNOWFLAKE_TABLE}")
-
