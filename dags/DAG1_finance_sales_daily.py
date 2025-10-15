@@ -15,13 +15,13 @@ from airflow.providers.google.cloud.hooks.bigquery import BigQueryHook
 from airflow.providers.google.cloud.hooks.gcs import GCSHook
 from google.cloud import bigquery
 from airflow.providers.snowflake.hooks.snowflake import SnowflakeHook
-from include.finance_sales_daily_sql import AGG_SQL_TEMPLATE
-from include.finance_sales_daily_config import finance_config
-
+from include.DAG1_finance_sales_daily_sql import AGG_SQL_TEMPLATE
+from include.DAG1_finance_sales_daily_config import finance_config
 
 conf = finance_config()
 
 # OpenLineage / Datasets (Astronomer observability)
+# I have added some OpenLineage inlets & outlets here for Data Lineage as it is a critical business process likely audited
 BQ_INLETS = [
     Dataset("bigquery://bigquery-public-data/thelook_ecommerce/order_items"),
     Dataset("bigquery://bigquery-public-data/thelook_ecommerce/products"),
@@ -68,6 +68,8 @@ def thelook_bq_to_snowflake_incremental():
         logger.info("Current max ORDER_DATE in Snowflake: %s", max_date)
         return {"max_order_date": str(max_date) if max_date else None}
 
+    #This is the task I queued on the bigger worker queue.
+    #That's because this is the most intensive task in the entire DAG as it saves results to a pd df and loads it to GCS
     @task(queue = "a10-worker-q",inlets=BQ_INLETS, outlets=[Dataset("gs://" + conf.GCS_BUCKET + "/" + conf.GCS_PREFIX)], task_id="extract_from_bigquery_to_gcs")
     def extract_from_bigquery_to_gcs(meta: dict) -> dict:
         tz_now = pendulum.now(conf.TZ).date()
@@ -220,7 +222,7 @@ def thelook_bq_to_snowflake_incremental():
         }
 
     # --------------------------
-    # NEW: Step 4 — Validation
+    # Step 4 — Validation
     # --------------------------
     @task(inlets=[SNOWFLAKE_OUTLET], outlets=[SNOWFLAKE_OUTLET], task_id="validate_loaded_window")
     def validate_loaded_window(extract_meta: dict, load_meta: dict, tolerance: float = 0.0) -> dict:
