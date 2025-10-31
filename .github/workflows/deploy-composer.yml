@@ -8,7 +8,7 @@ on:
       - 'plugins/**'
       - 'include/**'
       - 'gcccicd/**'
-      - 'requirements/**'
+      - 'requirements.txt'
       - '.github/workflows/deploy-composer.yml'
   workflow_dispatch: {}          # lets you run it manually
 
@@ -97,8 +97,8 @@ jobs:
             --location "$REGION" \
             --update-pypi-packages-from-file "requirements/requirements.txt"
 
-      # Optional sanity: show DAGs via Airflow CLI
-      - name: List DAGs
-        run: |
-          gcloud composer environments run "$COMPOSER_ENV" \
-            --location "$REGION" dags list -- --subdir /
+#      # Optional sanity: show DAGs via Airflow CLI
+#      - name: List DAGs
+#        run: |
+#          gcloud composer environments run "$COMPOSER_ENV" \
+#            --location "$REGION" dags list -- --subdir /
