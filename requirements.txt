@@ -5,7 +5,7 @@ pendulum>=3.0
 apache-airflow-providers-http
 google-cloud-bigquery>=3.13.0
 google-cloud-storage>=2.14.0
-pendulum>=2.1.2
+#pendulum>=2.1.2
 apache-airflow-providers-google
 apache-airflow-providers-snowflake>=6.2.0
 apache-airflow-providers-google>=12.0.0
