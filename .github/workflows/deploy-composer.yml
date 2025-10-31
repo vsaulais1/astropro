@@ -1,0 +1,104 @@
+name: Deploy DAGs to Cloud Composer
+
+on:
+  push:
+    branches: [ "main" ]        # adjust if you deploy from another branch
+    paths:
+      - 'dags/**'
+      - 'plugins/**'
+      - 'include/**'
+      - 'gcccicd/**'
+      - 'requirements/**'
+      - '.github/workflows/deploy-composer.yml'
+  workflow_dispatch: {}          # lets you run it manually
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write            # required for OIDC / WIF
+      contents: read
+
+    env:
+      PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+      PROJECT_NUMBER: ${{ vars.GCP_PROJECT_NUMBER }}
+      REGION: ${{ vars.COMPOSER_REGION }}
+      COMPOSER_ENV: ${{ vars.COMPOSER_ENV }}
+      SA_EMAIL: ${{ vars.DEPLOYER_SA_EMAIL }}
+      WIP_PATH: ${{ vars.WIF_PROVIDER }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud (WIF)
+        uses: google-github-actions/auth@v2
+        with:
+          project_id: ${{ env.PROJECT_ID }}
+          workload_identity_provider: ${{ env.WIP_PATH }}
+          service_account: ${{ env.SA_EMAIL }}
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+
+      # Optional static checks
+      - name: Python setup
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Lint DAGs
+        run: |
+          python -m pip install --upgrade pip
+          pip install flake8
+          flake8 dags || true   # don't fail the deploy on lint at first
+
+      # Get DAGs bucket prefix from Composer
+      - name: Get DAGs GCS prefix
+        id: dagprefix
+        run: |
+          PREFIX=$(gcloud composer environments describe "$COMPOSER_ENV" \
+            --location "$REGION" \
+            --format='value(config.dagGcsPrefix)')
+          echo "prefix=$PREFIX" | tee -a "$GITHUB_OUTPUT"
+
+      # Upload DAGs
+      - name: Upload DAGs
+        if: ${{ hashFiles('dags/**') != '' }}
+        run: |
+          gsutil -m rsync -r "dags" "${{ steps.dagprefix.outputs.prefix }}/"
+
+      # Upload plugins (if present)
+      - name: Upload plugins
+        if: ${{ hashFiles('plugins/**') != '' }}
+        run: |
+          BUCKET=$(echo "${{ steps.dagprefix.outputs.prefix }}" | sed 's|gs://\([^/]*\).*|\1|')
+          gsutil -m rsync -r "plugins" "gs://$BUCKET/plugins"
+
+      # Upload include (if present)
+      - name: Upload include
+        if: ${{ hashFiles('include/**') != '' }}
+        run: |
+          BUCKET=$(echo "${{ steps.dagprefix.outputs.prefix }}" | sed 's|gs://\([^/]*\).*|\1|')
+          gsutil -m rsync -r "include" "gs://$BUCKET/include"
+
+      # Upload gcccicd (if present)
+      - name: Upload gcccicd
+        if: ${{ hashFiles('gcccicd/**') != '' }}
+        run: |
+          BUCKET=$(echo "${{ steps.dagprefix.outputs.prefix }}" | sed 's|gs://\([^/]*\).*|\1|')
+          gsutil -m rsync -r "gcccicd" "gs://$BUCKET/gcccicd"      
+
+
+      # Update PyPI packages (if requirements/ exists)
+      - name: Update Composer PyPI packages
+        if: ${{ hashFiles('requirements/requirements.txt') != '' }}
+        run: |
+          gcloud composer environments update "$COMPOSER_ENV" \
+            --location "$REGION" \
+            --update-pypi-packages-from-file "requirements/requirements.txt"
+
+      # Optional sanity: show DAGs via Airflow CLI
+      - name: List DAGs
+        run: |
+          gcloud composer environments run "$COMPOSER_ENV" \
+            --location "$REGION" dags list -- --subdir /

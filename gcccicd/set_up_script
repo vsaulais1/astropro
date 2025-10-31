@@ -1,0 +1,77 @@
+# 0) Vars
+PROJECT_ID="astro-lab-se"
+REGION="europe-west1"         # e.g. us-central1, europe-west1
+COMPOSER_ENV="gccvivtest"
+GITHUB_OWNER="vsaulais1"
+GITHUB_REPO="astropro"
+POOL_ID="github-pool"
+PROVIDER_ID="github-provider"
+SA_NAME="composer-deployer"
+
+gcloud config set project $PROJECT_ID
+
+# 1) Create a service account used by GitHub jobs (no keys needed)
+gcloud iam service-accounts create $SA_NAME \
+  --display-name="GitHub Actions Composer Deployer"
+
+SA_EMAIL="$SA_NAME@$PROJECT_ID.iam.gserviceaccount.com"
+
+# 2) Workload Identity Federation pool + provider for GitHub
+gcloud iam workload-identity-pools create $POOL_ID \
+  --location="global" \
+  --display-name="GitHub Pool"
+
+POOL_FULL="projects/$(gcloud projects describe $PROJECT_ID --format='value(projectNumber)')/locations/global/workloadIdentityPools/$POOL_ID"
+
+gcloud iam workload-identity-pools providers create-oidc $PROVIDER_ID \
+  --location="global" \
+  --workload-identity-pool=$POOL_ID \
+  --display-name="GitHub Provider" \
+  --issuer-uri="https://token.actions.githubusercontent.com" \
+  --attribute-mapping="google.subject=assertion.sub,attribute.repository=assertion.repository,attribute.ref=assertion.ref"
+
+# 3) Allow your repo to impersonate the SA
+gcloud iam service-accounts add-iam-policy-binding $SA_EMAIL \
+  --role="roles/iam.workloadIdentityUser" \
+  --member="principalSet://iam.googleapis.com/$POOL_FULL/attribute.repository/$GITHUB_OWNER/$GITHUB_REPO"
+
+# 4) Find the DAGs bucket/prefix of your Composer env
+# Store this output; it's where we upload DAGs.
+DAGS_PREFIX=$(gcloud composer environments describe $COMPOSER_ENV \
+  --location $REGION \
+  --format='value(config.dagGcsPrefix)')
+echo "DAGs prefix: $DAGS_PREFIX"      # e.g. gs://us-central1-your-env-bucket/dags
+
+# 5) Grant minimal roles to the SA
+# Needed to upload to the DAGs & plugins folders and, optionally, update packages.
+DAGS_BUCKET=$(echo $DAGS_PREFIX | sed 's|gs://\([^/]*\).*|\1|')
+
+# Bucket object write
+gsutil iam ch serviceAccount:$SA_EMAIL:roles/storage.objectAdmin gs://$DAGS_BUCKET
+
+# Optional (for reading bucket metadata)
+gsutil iam ch serviceAccount:$SA_EMAIL:roles/storage.legacyBucketReader gs://$DAGS_BUCKET
+
+# If you plan to run `gcloud composer environments describe/update ...`
+gcloud projects add-iam-policy-binding $PROJECT_ID \
+  --member="serviceAccount:$SA_EMAIL" \
+  --role="roles/composer.admin"
+
+# If only uploading files (no environment updates), composer.admin is not strictly required.
+
+
+
+---------------
+
+POOL_ID="github-pool"
+PROVIDER_ID="github-provider"
+GITHUB_OWNER="vsaulais1"
+GITHUB_REPO="astropro"
+
+gcloud iam workload-identity-pools providers create-oidc "$PROVIDER_ID" \
+  --location=global \
+  --workload-identity-pool="$POOL_ID" \
+  --display-name="GitHub Provider" \
+  --issuer-uri="https://token.actions.githubusercontent.com" \
+  --attribute-mapping="google.subject=assertion.sub,attribute.repository=assertion.repository,attribute.ref=assertion.ref,attribute.workflow=assertion.workflow,attribute.actor=assertion.actor,attribute.run_number=assertion.run_number" \
+  --attribute-condition="attribute.repository=='$GITHUB_OWNER/$GITHUB_REPO' && attribute.ref.startsWith('refs/heads/main')"
