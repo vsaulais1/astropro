@@ -91,11 +91,11 @@ jobs:
 
       # Update PyPI packages (if requirements/ exists)
       - name: Update Composer PyPI packages
-        if: ${{ hashFiles('requirements/requirements.txt') != '' }}
+        if: ${{ hashFiles('requirements.txt') != '' }}
         run: |
           gcloud composer environments update "$COMPOSER_ENV" \
             --location "$REGION" \
-            --update-pypi-packages-from-file "requirements/requirements.txt"
+            --update-pypi-packages-from-file "requirements.txt"
 
 #      # Optional sanity: show DAGs via Airflow CLI
 #      - name: List DAGs
